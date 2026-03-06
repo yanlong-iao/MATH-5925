@@ -1,0 +1,127 @@
+---
+title: "毕业论文"
+author: "liao"
+date: "2026-02-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Save your current settings so you don't break other things later
+opt <- options() 
+
+# Force R to look for both binaries and source (prioritizing binaries)
+options(pkgType="both")
+install.packages("INLA", repos=c(getOption("repos"), INLA="https://inla.r-inla-download.org/R/stable"), dep=TRUE)
+```
+
+```{r}
+###########################
+## 0. 加载必要 R 包
+###########################
+library(INLA)
+library(ggplot2)
+library(viridis)
+library(gridExtra)
+
+###########################
+## 1. 读取并清洗数据 + 采样
+###########################
+data <- read.csv("tasmannia-xerophila-np-821-win-46.csv")
+
+# 调整：使用数据中实际的列名 temp.avg (作为y) 和 water.avg (作为协变量)
+# 同时剔除这些列中的 NA 值
+data <- data[!is.na(data$temp.avg) & !is.na(data$water.avg) & 
+             !is.na(data$longitude) & !is.na(data$latitude), ]
+
+set.seed(123)  
+n.sample <- min(3000, nrow(data)) # 确保采样数不超过总行数
+sub_index <- sample(1:nrow(data), n.sample)
+data_sub <- data[sub_index, ]
+
+# 抖动坐标以防止坐标重合导致矩阵奇异
+points <- jitter(as.matrix(data_sub[, c("longitude", "latitude")]), amount = 1e-5)
+
+###########################
+## 2. 构建 Mesh + SPDE 模型
+###########################
+# 建议：根据经纬度范围调整 max.edge，如果报错，尝试调大这些数值
+mesh <- inla.mesh.2d(
+  loc = points,
+  cutoff = 0.05,          # 针对经纬度尺度调整，防止点太挤
+  max.edge = c(0.5, 1.0), # 这里的数值应根据地图跨度调整
+  offset = c(0.2, 0.5)
+)
+
+# 绘制 Mesh 检查是否合理 (可选)
+# plot(mesh); points(points, col="red", pch=20, cex=0.5)
+
+spde <- inla.spde2.matern(mesh, alpha = 2)
+
+###########################
+## 3. 构建 Stack (数据封装)
+###########################
+A <- inla.spde.make.A(mesh, loc = points)
+mesh.index <- inla.spde.make.index(name = "field", n.spde = mesh$n)
+
+stack <- inla.stack(
+  data = list(y = data_sub$temp.avg), # 目标变量：平均气温
+  A = list(A, 1),
+  effects = list(
+    c(mesh.index, list(intercept = 1)),
+    list(water_cov = data_sub$water.avg) # 协变量：平均降水/水分
+  ),
+  tag = "predictor"
+)
+
+###########################
+## 4. 拟合 INLA 模型
+###########################
+# 公式：气温 ~ 截距 + 水分 + 空间随机效应
+formula <- y ~ -1 + intercept + water_cov + f(field, model = spde)
+
+result <- inla(
+  formula,
+  data = inla.stack.data(stack, spde = spde),
+  family = "normal",
+  control.predictor = list(
+    A = inla.stack.A(stack),
+    compute = TRUE
+  ),
+  control.inla = list(strategy = "gaussian", int.strategy = "eb")
+)
+
+###########################
+## 5. 提取结果并绘图
+###########################
+index <- inla.stack.index(stack, tag = "predictor")$data
+
+df_res <- data.frame(
+  Longitude = data_sub$longitude,
+  Latitude = data_sub$latitude,
+  Observed = data_sub$temp.avg,
+  Predicted = result$summary.fitted.values$mean[index],
+  Uncertainty = result$summary.fitted.values$sd[index]
+)
+
+# 绘图：预测的温度空间分布
+p1 <- ggplot(df_res, aes(x = Longitude, y = Latitude, color = Predicted)) +
+  geom_point(size = 1.5, alpha = 0.8) +
+  scale_color_viridis_c(option = "magma") +
+  labs(title = "Posterior Mean of temp.avg", color = "Temp") +
+  theme_minimal() +
+  coord_fixed()
+
+# 绘图：预测的不确定性 (SD)
+p2 <- ggplot(df_res, aes(x = Longitude, y = Latitude, color = Uncertainty)) +
+  geom_point(size = 1.5) +
+  scale_color_viridis_c(option = "mako") +
+  labs(title = "Prediction Uncertainty (SD)", color = "SD") +
+  theme_minimal() +
+  coord_fixed()
+
+grid.arrange(p1, p2, ncol = 2)
+```
